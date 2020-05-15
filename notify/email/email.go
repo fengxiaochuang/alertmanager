@@ -27,9 +27,11 @@ import (
 	"net/smtp"
 	"net/textproto"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/git-lfs/go-ntlm/ntlm"
 	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/log/level"
 	"github.com/pkg/errors"
@@ -106,6 +108,18 @@ func (n *Email) auth(mechs string) (smtp.Auth, error) {
 				continue
 			}
 			return LoginAuth(username, password), nil
+		case "NTLM":
+			password := string(n.conf.AuthPassword)
+			if password == "" {
+				err.Add(errors.New("missing password for NTLM-V1 auth mechanism"))
+				continue
+			}
+			//try parsing AuthIdentity as ntlm version, or set to 1 as defaults
+			version, err := strconv.Atoi(n.conf.AuthIdentity)
+			if err != nil {
+				version = 1
+			}
+			return NTLMAuth(username, password, n.conf.Smarthost.Host, ntlm.Version(version)), nil
 		}
 	}
 	if err.Len() == 0 {
@@ -117,12 +131,16 @@ func (n *Email) auth(mechs string) (smtp.Auth, error) {
 // Notify implements the Notifier interface.
 func (n *Email) Notify(ctx context.Context, as ...*types.Alert) (bool, error) {
 	var (
-		c       *smtp.Client
+		c       *Client
 		conn    net.Conn
 		err     error
 		success = false
 	)
-	if n.conf.Smarthost.Port == "465" {
+
+	// Since some servers (like exchange server) do not start tls at negotiation period,
+	// But it still listen on 465 port, so we need to change the dial logic by checking config's RequireTLS
+	// Global Config guarantees RequireTLS is not nil.
+	if *n.conf.RequireTLS {
 		tlsConfig, err := commoncfg.NewTLSConfig(&n.conf.TLSConfig)
 		if err != nil {
 			return false, errors.Wrap(err, "parse TLS configuration")
@@ -145,7 +163,7 @@ func (n *Email) Notify(ctx context.Context, as ...*types.Alert) (bool, error) {
 			return true, errors.Wrap(err, "establish connection to server")
 		}
 	}
-	c, err = smtp.NewClient(conn, n.conf.Smarthost.Host)
+	c, err = newClient(conn, n.conf.Smarthost.Host)
 	if err != nil {
 		conn.Close()
 		return true, errors.Wrap(err, "create SMTP client")
@@ -162,14 +180,15 @@ func (n *Email) Notify(ctx context.Context, as ...*types.Alert) (bool, error) {
 		if err != nil {
 			return true, errors.Wrap(err, "send EHLO command")
 		}
+	} else {
+		err = c.hello()
+		if err != nil {
+			return true, errors.Wrap(err, "send EHLO command")
+		}
 	}
 
-	// Global Config guarantees RequireTLS is not nil.
-	if *n.conf.RequireTLS {
-		if ok, _ := c.Extension("STARTTLS"); !ok {
-			return true, errors.Errorf("'require_tls' is true (default) but %q does not advertise the STARTTLS extension", n.conf.Smarthost)
-		}
-
+	if ok, _ := c.Extension("STARTTLS"); ok {
+		// return true, errors.Errorf("'require_tls' is true (default) but %q does not advertise the STARTTLS extension", n.conf.Smarthost)
 		tlsConf, err := commoncfg.NewTLSConfig(&n.conf.TLSConfig)
 		if err != nil {
 			return false, errors.Wrap(err, "parse TLS configuration")
@@ -177,7 +196,6 @@ func (n *Email) Notify(ctx context.Context, as ...*types.Alert) (bool, error) {
 		if tlsConf.ServerName == "" {
 			tlsConf.ServerName = n.conf.Smarthost.Host
 		}
-
 		if err := c.StartTLS(tlsConf); err != nil {
 			return true, errors.Wrap(err, "send STARTTLS command")
 		}
